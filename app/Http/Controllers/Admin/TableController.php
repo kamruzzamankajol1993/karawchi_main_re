@@ -1,0 +1,162 @@
+<?php
+
+namespace App\Http\Controllers\Admin;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use App\Models\Table;
+use App\Models\Zone;
+use App\Models\FloorZone;
+use App\Models\TableBooking;
+use Exception;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+
+class TableController extends Controller
+{
+  public function index()
+    {
+        $zones = Zone::all();
+        $floorZones = FloorZone::all();
+
+        // টেবিলের সাথে রানিং অর্ডার, KOT এবং ওয়েটারের ডাটা নিয়ে আসা হচ্ছে
+        $tables = Table::with(['zone', 'floorZone', 'orders' => function($query) {
+            $query->whereIn('status', ['Pending', 'Processing'])
+                  ->with(['kots.orderDetails', 'waiter']); // Eager load KOTs and Waiter
+        }])->orderBy('table_number', 'asc')->get();
+
+        $tables->map(function ($table) {
+            $hasBooking = TableBooking::where('table_id', $table->id)
+                ->whereIn('status', ['upcoming','confirmed'])
+                ->whereDate('booking_date', '>=', now()->toDateString())
+                ->exists();
+            if ($hasBooking) {
+                $table->dynamic_status = 'reserved';
+            } elseif ($table->orders->count() > 0) {
+                $table->dynamic_status = 'occupied';
+            } else {
+                $table->dynamic_status = strtolower(trim((string) $table->initial_status));
+            }
+            return $table;
+        });
+
+        $totalTables = $tables->count();
+        $occupiedCount = $tables->where('dynamic_status', 'occupied')->count();
+        $availableCount = $tables->where('dynamic_status', 'available')->count();
+        $reservedCount = $tables->where('dynamic_status', 'reserved')->count();
+
+        return view('admin.table.index', compact(
+            'tables', 'zones', 'floorZones', 'totalTables', 'occupiedCount', 'availableCount', 'reservedCount'
+        ));
+    }
+    public function store(Request $request)
+    {
+        $request->validate([
+            'table_number' => 'required|string|unique:tables,table_number',
+            'seating_capacity' => 'required|integer|min:1',
+            'floor_zone_id' => 'required|exists:floor_zones,id',
+            'initial_status' => 'nullable|string|in:available,occupied,reserved',
+        ]);
+
+        DB::beginTransaction();
+        try {
+            Table::create([
+                'table_number' => $request->table_number,
+                'seating_capacity' => $request->seating_capacity,
+                'zone_id' => $this->resolveLegacyZoneId((int) $request->floor_zone_id),
+                'floor_zone_id' => $request->floor_zone_id,
+                'initial_status' => strtolower((string) $request->input('initial_status', 'available')),
+                'notes' => $request->notes,
+            ]);
+
+            DB::commit();
+            return back()->with('success', 'Table added successfully!');
+        } catch (Exception $e) {
+            DB::rollBack();
+            Log::error('Table Creation Failed: ' . $e->getMessage());
+            return back()->with('error', 'Failed to add table! Please check logs.');
+        }
+    }
+
+    public function update(Request $request, $id)
+    {
+        $request->validate([
+            'table_number' => 'required|string|unique:tables,table_number,' . $id,
+            'seating_capacity' => 'required|integer|min:1',
+            'floor_zone_id' => 'required|exists:floor_zones,id',
+            'initial_status' => 'nullable|string|in:available,occupied,reserved',
+        ]);
+
+        DB::beginTransaction();
+        try {
+            $table = Table::findOrFail($id);
+            $table->update([
+                'table_number' => $request->table_number,
+                'seating_capacity' => $request->seating_capacity,
+                'zone_id' => $this->resolveLegacyZoneId((int) $request->floor_zone_id, $table->zone_id),
+                'floor_zone_id' => $request->floor_zone_id,
+                'initial_status' => strtolower((string) $request->input('initial_status', 'available')),
+                'notes' => $request->notes,
+            ]);
+
+            DB::commit();
+            return back()->with('success', 'Table updated successfully!');
+        } catch (Exception $e) {
+            DB::rollBack();
+            Log::error('Table Update Failed: ' . $e->getMessage());
+            return back()->with('error', 'Failed to update table!');
+        }
+    }
+
+    /**
+     * Keep the legacy, non-null tables.zone_id in sync with the newer
+     * floor_zone_id used by Table Management. Older booking/waiter flows still
+     * read the Zone relation, so we resolve/create a matching legacy Zone by
+     * Floor / Zone name instead of ever writing NULL to zone_id.
+     */
+    private function resolveLegacyZoneId(int $floorZoneId, ?int $fallbackZoneId = null): int
+    {
+        $floorZone = FloorZone::findOrFail($floorZoneId);
+
+        $zone = Zone::firstOrCreate(
+            ['name' => $floorZone->name],
+            ['status' => true]
+        );
+
+        return (int) ($zone->id ?: $fallbackZoneId);
+    }
+
+    public function storeFloorZone(Request $request)
+    {
+        $request->validate(['name'=>'required|string|max:100']);
+        FloorZone::create(['name'=>$request->name]);
+        return back()->with('success','Floor / Zone added successfully!');
+    }
+
+    public function updateFloorZone(Request $request, $id)
+    {
+        $request->validate(['name'=>'required|string|max:100']);
+        FloorZone::findOrFail($id)->update(['name'=>$request->name]);
+        return back()->with('success','Floor / Zone updated successfully!');
+    }
+
+    public function destroyFloorZone($id)
+    {
+        FloorZone::findOrFail($id)->delete();
+        return back()->with('success','Floor / Zone deleted successfully!');
+    }
+
+    public function destroy($id)
+    {
+        DB::beginTransaction();
+        try {
+            Table::findOrFail($id)->delete();
+            DB::commit();
+            return back()->with('success', 'Table deleted successfully!');
+        } catch (Exception $e) {
+            DB::rollBack();
+            Log::error('Table Deletion Failed: ' . $e->getMessage());
+            return back()->with('error', 'Failed to delete table!');
+        }
+    }
+}
