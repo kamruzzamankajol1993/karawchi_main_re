@@ -59,7 +59,7 @@ class OrderController extends Controller
 
     public function show($id)
     {
-        $order = Order::with(['customer', 'table', 'waiter', 'orderDetails', 'user', 'deliveryPartner', 'duePayments.user'])->findOrFail($id);
+        $order = Order::with(['customer', 'table', 'waiter', 'orderDetails', 'user', 'deliveryPartner'])->findOrFail($id);
         return view('admin.order.partials._order_details', compact('order'))->render();
     }
 
@@ -498,9 +498,68 @@ $mpdf->SetFooter('Generated: ' . now()->format('d M Y, h:i A') . '||Page {PAGENO
             'paid_in_cash' => ['nullable', 'numeric', 'min:0'],
             'paid_in_card' => ['nullable', 'numeric', 'min:0'],
             'paid_in_mfc' => ['nullable', 'numeric', 'min:0'],
+            'card_type' => ['nullable', 'string', 'max:100'],
+            'mfs_provider' => ['nullable', 'string', 'max:100'],
             'transaction_id' => ['nullable', 'string', 'max:255'],
+            'split_card_type' => ['nullable', 'string', 'max:100'],
+            'split_mfs_provider' => ['nullable', 'string', 'max:100'],
+            'split_card_reference' => ['nullable', 'string', 'max:255'],
+            'split_mfs_reference' => ['nullable', 'string', 'max:255'],
             'delivery_partner' => ['nullable', 'nullable'],
         ]);
+
+        $allowedCardTypes = ['Visa', 'Mastercard', 'American Express', 'UnionPay', 'JCB', 'Nexus', 'Diners Club', 'GPay', 'Other'];
+        $allowedMfsProviders = ['Rocket', 'bKash', 'MYCash', 'Islami Bank mCash', 'tap', 'FirstCash', 'Upay', 'OK Wallet', 'RUPALICASH', 'TeleCash', 'Islamic Wallet', 'Meghna Pay', 'Nagad', 'LENDEN', 'Other'];
+        $editPaymentMethod = (string) $request->input('payment_method');
+
+        if ($editPaymentMethod === 'Card') {
+            $editCardType = trim((string) $request->input('card_type'));
+            $editReference = trim((string) $request->input('transaction_id'));
+
+            if (!in_array($editCardType, $allowedCardTypes, true)) {
+                return back()->withErrors(['card_type' => 'Please select a valid Card Name.'])->withInput();
+            }
+            if ($editReference === '') {
+                return back()->withErrors(['transaction_id' => 'Bank / Card Reference Number is required.'])->withInput();
+            }
+        } elseif ($editPaymentMethod === 'Mobile Banking') {
+            $editMfsProvider = trim((string) $request->input('mfs_provider'));
+            $editReference = trim((string) $request->input('transaction_id'));
+
+            if (!in_array($editMfsProvider, $allowedMfsProviders, true)) {
+                return back()->withErrors(['mfs_provider' => 'Please select a valid MFS service.'])->withInput();
+            }
+            if ($editReference === '') {
+                return back()->withErrors(['transaction_id' => 'MFS Reference Number is required.'])->withInput();
+            }
+        } elseif ($editPaymentMethod === 'Split') {
+            $editSplitCardAmount = max(0, (float) $request->input('paid_in_card', 0));
+            $editSplitMfsAmount = max(0, (float) $request->input('paid_in_mfc', 0));
+
+            if ($editSplitCardAmount > 0) {
+                $editSplitCardType = trim((string) $request->input('split_card_type'));
+                $editSplitCardReference = trim((string) $request->input('split_card_reference'));
+
+                if (!in_array($editSplitCardType, $allowedCardTypes, true)) {
+                    return back()->withErrors(['split_card_type' => 'Please select a valid Card Type for the Split Bank / Card amount.'])->withInput();
+                }
+                if ($editSplitCardReference === '') {
+                    return back()->withErrors(['split_card_reference' => 'Bank / Card Reference Number is required when a Split Bank / Card amount is entered.'])->withInput();
+                }
+            }
+
+            if ($editSplitMfsAmount > 0) {
+                $editSplitMfsProvider = trim((string) $request->input('split_mfs_provider'));
+                $editSplitMfsReference = trim((string) $request->input('split_mfs_reference'));
+
+                if (!in_array($editSplitMfsProvider, $allowedMfsProviders, true)) {
+                    return back()->withErrors(['split_mfs_provider' => 'Please select a valid MFS service for the Split MFS amount.'])->withInput();
+                }
+                if ($editSplitMfsReference === '') {
+                    return back()->withErrors(['split_mfs_reference' => 'MFS Reference Number is required when a Split MFS amount is entered.'])->withInput();
+                }
+            }
+        }
 
         DB::beginTransaction();
 
@@ -754,8 +813,40 @@ $mpdf->SetFooter('Generated: ' . now()->format('d M Y, h:i A') . '||Page {PAGENO
             $order->service_charge = $serviceCharge;
             $order->grand_total = $grandTotal;
             $order->payment_type = $paymentMethod;
-            // Transaction / Reference No will be stored only for Card or Mobile Banking. Other payment types will clear it.
-            $order->transaction_id = in_array($paymentMethod, ['Card', 'Mobile Banking'], true) ? $request->transaction_id : null;
+
+            $orderCardType = null;
+            $orderMfsProvider = null;
+            if ($paymentMethod === 'Card') {
+                $orderCardType = trim((string) $request->input('card_type'));
+            } elseif ($paymentMethod === 'Mobile Banking') {
+                $orderMfsProvider = trim((string) $request->input('mfs_provider'));
+            } elseif ($paymentMethod === 'Split') {
+                $orderCardType = $card > 0 ? trim((string) $request->input('split_card_type')) : null;
+                $orderMfsProvider = $mfc > 0 ? trim((string) $request->input('split_mfs_provider')) : null;
+            }
+
+            // Single Bank/Card or MFS keeps one required reference, just like POS.
+            $order->transaction_id = in_array($paymentMethod, ['Card', 'Mobile Banking'], true)
+                ? trim((string) $request->input('transaction_id'))
+                : null;
+
+            if (Schema::hasColumn('orders', 'card_type')) {
+                $order->card_type = $orderCardType ?: null;
+            }
+            if (Schema::hasColumn('orders', 'mfs_provider')) {
+                $order->mfs_provider = $orderMfsProvider ?: null;
+            }
+            if (Schema::hasColumn('orders', 'split_card_reference')) {
+                $order->split_card_reference = $paymentMethod === 'Split' && $card > 0
+                    ? trim((string) $request->input('split_card_reference'))
+                    : null;
+            }
+            if (Schema::hasColumn('orders', 'split_mfs_reference')) {
+                $order->split_mfs_reference = $paymentMethod === 'Split' && $mfc > 0
+                    ? trim((string) $request->input('split_mfs_reference'))
+                    : null;
+            }
+
             $order->total_paid_amount = $totalPaid;
             $order->paid_in_cash = $cash;
             $order->paid_in_card = $card;
@@ -810,24 +901,122 @@ $mpdf->SetFooter('Generated: ' . now()->format('d M Y, h:i A') . '||Page {PAGENO
 
 
     /**
+     * Dedicated due settlement page. Due collection and payment history live here,
+     * separate from the order edit/details pages.
+     */
+    public function dueSettlement($id)
+    {
+        $order = Order::with(['customer', 'table', 'waiter', 'user', 'deliveryPartner', 'duePayments.user'])->findOrFail($id);
+
+        return view('admin.order.due_settlement', compact('order'));
+    }
+
+    /**
      * Collect a later payment against an existing due balance and keep an auditable history.
      */
     public function payDue(Request $request, $id)
     {
         abort_unless(auth()->user()?->can('order-edit'), 403);
 
-        $request->validate([
-            'amount' => ['required', 'numeric', 'gt:0'],
-            'payment_type' => ['required', Rule::in(['Cash', 'Card', 'Mobile Banking'])],
+        $allowedCardTypes = ['Visa', 'Mastercard', 'American Express', 'UnionPay', 'JCB', 'Nexus', 'Diners Club', 'GPay', 'Other'];
+        $allowedMfsProviders = ['Rocket', 'bKash', 'MYCash', 'Islami Bank mCash', 'tap', 'FirstCash', 'Upay', 'OK Wallet', 'RUPALICASH', 'TeleCash', 'Islamic Wallet', 'Meghna Pay', 'Nagad', 'LENDEN', 'Other'];
+
+        $request->validateWithBag('duePayment', [
+            'payment_type' => ['required', Rule::in(['Cash', 'Card', 'Mobile Banking', 'Split'])],
+            'amount' => ['nullable', 'numeric', 'min:0'],
+            'card_type' => ['nullable', 'string', 'max:100'],
+            'mfs_provider' => ['nullable', 'string', 'max:100'],
             'transaction_reference' => ['nullable', 'string', 'max:255'],
+            'paid_in_cash' => ['nullable', 'numeric', 'min:0'],
+            'paid_in_card' => ['nullable', 'numeric', 'min:0'],
+            'paid_in_mfc' => ['nullable', 'numeric', 'min:0'],
+            'split_card_type' => ['nullable', 'string', 'max:100'],
+            'split_mfs_provider' => ['nullable', 'string', 'max:100'],
+            'split_card_reference' => ['nullable', 'string', 'max:255'],
+            'split_mfs_reference' => ['nullable', 'string', 'max:255'],
             'remark' => ['nullable', 'string', 'max:1000'],
+            'paid_at' => ['required', 'date_format:Y-m-d', 'before_or_equal:today'],
         ]);
 
-        if (in_array($request->payment_type, ['Card', 'Mobile Banking'], true)
-            && trim((string) $request->transaction_reference) === '') {
-            return back()->withErrors([
-                'transaction_reference' => 'Reference number is required for Bank / Card or Mobile Banking due payment.',
-            ])->withInput();
+        $paymentType = (string) $request->payment_type;
+        $cashAmount = 0.0;
+        $cardAmount = 0.0;
+        $mfsAmount = 0.0;
+        $amount = max(0, round((float) $request->input('amount', 0), 2));
+        $cardType = null;
+        $mfsProvider = null;
+        $transactionReference = null;
+        $splitCardReference = null;
+        $splitMfsReference = null;
+        $paymentDate = Carbon::createFromFormat('Y-m-d', (string) $request->input('paid_at'));
+        $currentTime = now();
+        $paymentDate->setTime($currentTime->hour, $currentTime->minute, $currentTime->second);
+
+        if ($paymentType === 'Card') {
+            $cardType = trim((string) $request->input('card_type'));
+            $transactionReference = trim((string) $request->input('transaction_reference'));
+
+            if (!in_array($cardType, $allowedCardTypes, true)) {
+                return back()->withErrors(['card_type' => 'Please select a valid card type.'], 'duePayment')->withInput();
+            }
+            if ($transactionReference === '') {
+                return back()->withErrors(['transaction_reference' => 'Bank / Card Reference Number is required.'], 'duePayment')->withInput();
+            }
+        } elseif ($paymentType === 'Mobile Banking') {
+            $mfsProvider = trim((string) $request->input('mfs_provider'));
+            $transactionReference = trim((string) $request->input('transaction_reference'));
+
+            if (!in_array($mfsProvider, $allowedMfsProviders, true)) {
+                return back()->withErrors(['mfs_provider' => 'Please select a valid MFS service.'], 'duePayment')->withInput();
+            }
+            if ($transactionReference === '') {
+                return back()->withErrors(['transaction_reference' => 'MFS Reference Number is required.'], 'duePayment')->withInput();
+            }
+        } elseif ($paymentType === 'Split') {
+            $cashAmount = max(0, round((float) $request->input('paid_in_cash', 0), 2));
+            $cardAmount = max(0, round((float) $request->input('paid_in_card', 0), 2));
+            $mfsAmount = max(0, round((float) $request->input('paid_in_mfc', 0), 2));
+            $amount = round($cashAmount + $cardAmount + $mfsAmount, 2);
+
+            if ($amount <= 0) {
+                return back()->withErrors(['paid_in_cash' => 'Enter at least one Split payment amount.'], 'duePayment')->withInput();
+            }
+
+            if ($cardAmount > 0) {
+                $cardType = trim((string) $request->input('split_card_type'));
+                $splitCardReference = trim((string) $request->input('split_card_reference'));
+
+                if (!in_array($cardType, $allowedCardTypes, true)) {
+                    return back()->withErrors(['split_card_type' => 'Please select a valid card type for the Split Bank / Card amount.'], 'duePayment')->withInput();
+                }
+                if ($splitCardReference === '') {
+                    return back()->withErrors(['split_card_reference' => 'Bank / Card Reference Number is required when a Bank / Card amount is entered.'], 'duePayment')->withInput();
+                }
+            }
+
+            if ($mfsAmount > 0) {
+                $mfsProvider = trim((string) $request->input('split_mfs_provider'));
+                $splitMfsReference = trim((string) $request->input('split_mfs_reference'));
+
+                if (!in_array($mfsProvider, $allowedMfsProviders, true)) {
+                    return back()->withErrors(['split_mfs_provider' => 'Please select a valid MFS service for the Split MFS amount.'], 'duePayment')->withInput();
+                }
+                if ($splitMfsReference === '') {
+                    return back()->withErrors(['split_mfs_reference' => 'MFS Reference Number is required when an MFS amount is entered.'], 'duePayment')->withInput();
+                }
+            }
+        }
+
+        if ($paymentType !== 'Split' && $amount <= 0) {
+            return back()->withErrors(['amount' => 'Payment Amount must be greater than 0.'], 'duePayment')->withInput();
+        }
+
+        if ($paymentType === 'Cash') {
+            $cashAmount = $amount;
+        } elseif ($paymentType === 'Card') {
+            $cardAmount = $amount;
+        } elseif ($paymentType === 'Mobile Banking') {
+            $mfsAmount = $amount;
         }
 
         DB::beginTransaction();
@@ -835,7 +1024,6 @@ $mpdf->SetFooter('Generated: ' . now()->format('d M Y, h:i A') . '||Page {PAGENO
         try {
             $order = Order::lockForUpdate()->findOrFail($id);
             $dueBefore = max(0, round((float) ($order->due ?? 0), 2));
-            $amount = max(0, round((float) $request->amount, 2));
 
             if ($dueBefore <= 0) {
                 DB::rollBack();
@@ -844,13 +1032,14 @@ $mpdf->SetFooter('Generated: ' . now()->format('d M Y, h:i A') . '||Page {PAGENO
 
             if ($amount > $dueBefore) {
                 DB::rollBack();
+                $amountErrorKey = $paymentType === 'Split' ? 'paid_in_cash' : 'amount';
+
                 return back()->withErrors([
-                    'amount' => 'Due payment cannot exceed the remaining due amount of ৳' . number_format($dueBefore, 2) . '.',
-                ])->withInput();
+                    $amountErrorKey => 'Due payment cannot exceed the remaining due amount of ৳' . number_format($dueBefore, 2) . '.',
+                ], 'duePayment')->withInput();
             }
 
             $dueAfter = max(0, round($dueBefore - $amount, 2));
-            $paymentType = $request->payment_type;
 
             \App\Models\OrderDuePayment::create([
                 'order_id' => $order->id,
@@ -859,21 +1048,30 @@ $mpdf->SetFooter('Generated: ' . now()->format('d M Y, h:i A') . '||Page {PAGENO
                 'due_after' => $dueAfter,
                 'payment_type' => $paymentType,
                 'transaction_reference' => in_array($paymentType, ['Card', 'Mobile Banking'], true)
-                    ? trim((string) $request->transaction_reference)
+                    ? $transactionReference
                     : null,
+                'card_type' => $cardType,
+                'mfs_provider' => $mfsProvider,
+                'paid_in_cash' => $cashAmount,
+                'paid_in_card' => $cardAmount,
+                'paid_in_mfc' => $mfsAmount,
+                'split_card_reference' => $paymentType === 'Split' && $cardAmount > 0 ? $splitCardReference : null,
+                'split_mfs_reference' => $paymentType === 'Split' && $mfsAmount > 0 ? $splitMfsReference : null,
                 'remark' => trim((string) $request->remark) !== '' ? trim((string) $request->remark) : null,
                 'received_by' => auth()->id(),
-                'paid_at' => now(),
+                'paid_at' => $paymentDate,
             ]);
 
             $order->total_paid_amount = round((float) ($order->total_paid_amount ?? 0) + $amount, 2);
+            $order->paid_in_cash = round((float) ($order->paid_in_cash ?? 0) + $cashAmount, 2);
+            $order->paid_in_card = round((float) ($order->paid_in_card ?? 0) + $cardAmount, 2);
+            $order->paid_in_mfc = round((float) ($order->paid_in_mfc ?? 0) + $mfsAmount, 2);
 
-            if ($paymentType === 'Cash') {
-                $order->paid_in_cash = round((float) ($order->paid_in_cash ?? 0) + $amount, 2);
-            } elseif ($paymentType === 'Card') {
-                $order->paid_in_card = round((float) ($order->paid_in_card ?? 0) + $amount, 2);
-            } else {
-                $order->paid_in_mfc = round((float) ($order->paid_in_mfc ?? 0) + $amount, 2);
+            if ($cardAmount > 0 && $cardType !== null && Schema::hasColumn('orders', 'card_type')) {
+                $order->card_type = $cardType;
+            }
+            if ($mfsAmount > 0 && $mfsProvider !== null && Schema::hasColumn('orders', 'mfs_provider')) {
+                $order->mfs_provider = $mfsProvider;
             }
 
             $activeMethods = collect([
@@ -891,7 +1089,7 @@ $mpdf->SetFooter('Generated: ' . now()->format('d M Y, h:i A') . '||Page {PAGENO
             DB::commit();
 
             return redirect()
-                ->route('order.details', $order->id)
+                ->route('order.due_settlement', $order->id)
                 ->with('success', 'Due payment of ৳' . number_format($amount, 2) . ' received successfully.');
         } catch (\Throwable $e) {
             DB::rollBack();
@@ -902,7 +1100,7 @@ $mpdf->SetFooter('Generated: ' . now()->format('d M Y, h:i A') . '||Page {PAGENO
 
     public function details($id)
     {
-        $order = Order::with(['customer', 'table', 'waiter', 'orderDetails', 'user', 'deliveryPartner', 'review', 'duePayments.user'])->findOrFail($id);
+        $order = Order::with(['customer', 'table', 'waiter', 'orderDetails', 'user', 'deliveryPartner', 'review'])->findOrFail($id);
 
         return view('admin.order.show', compact('order'));
     }
